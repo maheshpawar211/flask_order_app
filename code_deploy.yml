@@ -1,0 +1,154 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  imageName: "flask-orders-app"
+  dockerfilePath: "Dockerfile"
+  buildContext: "."
+  # Set in pipeline variables or variable groups:
+  # ACR_SERVICE_CONNECTION
+  # ACR_LOGIN_SERVER (example: myacr.azurecr.io)
+  # DEV_DB_URL, QA_DB_URL
+  # DEV_WEBAPP_NAME, QA_WEBAPP_NAME, PROD_WEBAPP_NAME
+  # AZURE_SERVICE_CONNECTION
+  # PROD_KEYVAULT_NAME
+  # Key Vault secrets: prod-db-user, prod-db-password, prod-db-host, prod-db-name
+
+stages:
+- stage: Build
+  displayName: Build and Push Image
+  jobs:
+  - job: BuildPush
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      displayName: Build and Push
+      inputs:
+        containerRegistry: "$(ACR_SERVICE_CONNECTION)"
+        repository: "$(imageName)"
+        command: "buildAndPush"
+        Dockerfile: "$(dockerfilePath)"
+        buildContext: "$(buildContext)"
+        tags: |
+          $(Build.BuildId)
+          latest
+
+- stage: Dev
+  displayName: Deploy Dev
+  dependsOn: Build
+  jobs:
+  - job: MigrateDev
+    displayName: DB Migrate (Dev)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      displayName: ACR Login
+      inputs:
+        containerRegistry: "$(ACR_SERVICE_CONNECTION)"
+        command: "login"
+    - script: |
+        docker run --rm \
+          -e APP_ENV=development \
+          -e DATABASE_URL="$(DEV_DB_URL)" \
+          $(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId) \
+          flask --app run.py db upgrade
+      displayName: Run Alembic Upgrade (Dev)
+
+  - job: DeployDev
+    displayName: Deploy App (Dev)
+    dependsOn: MigrateDev
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureWebAppContainer@1
+      inputs:
+        azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+        appName: "$(DEV_WEBAPP_NAME)"
+        containers: "$(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId)"
+
+- stage: QA
+  displayName: Deploy QA
+  dependsOn: Dev
+  jobs:
+  - job: MigrateQA
+    displayName: DB Migrate (QA)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      inputs:
+        containerRegistry: "$(ACR_SERVICE_CONNECTION)"
+        command: "login"
+    - script: |
+        docker run --rm \
+          -e APP_ENV=qa \
+          -e DATABASE_URL="$(QA_DB_URL)" \
+          $(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId) \
+          flask --app run.py db upgrade
+      displayName: Run Alembic Upgrade (QA)
+
+  - job: DeployQA
+    displayName: Deploy App (QA)
+    dependsOn: MigrateQA
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureWebAppContainer@1
+      inputs:
+        azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+        appName: "$(QA_WEBAPP_NAME)"
+        containers: "$(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId)"
+
+- stage: Prod
+  displayName: Deploy Prod
+  dependsOn: QA
+  jobs:
+  - job: MigrateProd
+    displayName: DB Migrate (Prod)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureKeyVault@2
+      displayName: Fetch Prod DB Secrets
+      inputs:
+        azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+        KeyVaultName: "$(PROD_KEYVAULT_NAME)"
+        SecretsFilter: "prod-db-user,prod-db-password,prod-db-host,prod-db-name"
+        RunAsPreJob: false
+    - task: Docker@2
+      inputs:
+        containerRegistry: "$(ACR_SERVICE_CONNECTION)"
+        command: "login"
+    - script: |
+        set -euo pipefail
+        ENCODED_PASS=$(python -c "import os, urllib.parse; print(urllib.parse.quote(os.environ['DB_PASS'], safe=''))")
+        DATABASE_URL="postgresql://${DB_USER}:${ENCODED_PASS}@${DB_HOST}:5432/${DB_NAME}?sslmode=require"
+
+        docker run --rm \
+          -e APP_ENV=production \
+          -e DATABASE_URL="${DATABASE_URL}" \
+          $(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId) \
+          flask --app run.py db upgrade
+      displayName: Run Alembic Upgrade (Prod)
+      env:
+        DB_USER: $(prod-db-user)
+        DB_PASS: $(prod-db-password)
+        DB_HOST: $(prod-db-host)
+        DB_NAME: $(prod-db-name)
+
+  - job: DeployProd
+    displayName: Deploy App (Prod)
+    dependsOn: MigrateProd
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureWebAppContainer@1
+      inputs:
+        azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+        appName: "$(PROD_WEBAPP_NAME)"
+        containers: "$(ACR_LOGIN_SERVER)/$(imageName):$(Build.BuildId)"

@@ -1,0 +1,8 @@
+version: "3.9"
+
+services:
+  app:
+    container_name: flask_orders_app_qa
+    environment:
+      APP_ENV: qa
+      DATABASE_URL: postgresql://postgres:postgres@host.docker.internal:5432/appdb_qa
